@@ -129,7 +129,15 @@ print_help() ->
         "           <output-avm-file> is the output AVM file,~n"
         "           [<input-file>]+ is a list of one or more input files,~n"
         "           and <options> are among the following:~n"
-        "              [--prune|-p]           Prune dependencies~n"
+        "              [--prune|-p]           Prune functions from init:boot/1~n"
+        "              [--prune-modules]      Legacy module-only pruning~n"
+        "              [--prune-functions]    Remove unreachable functions and literals~n"
+        "              [--reference <avm>]    Analyze library without bundling it (repeatable)~n"
+        "              [--external|-e <avm>]  Bundle library AVM (repeatable)~n"
+        "              [--keep M:F/A]         Additional reachable function (repeatable)~n"
+        "              [--suggest-drivers]    Suggest unused port drivers and NIFs~n"
+        "              [--precision <mode>]   full (default), adaptive, insensitive or coarse~n"
+        "              [--jit-types]          Trust the analysis: add types for the JIT, drop proven tests~n"
         "              [--lib|-l]             Create a library avm, with no start module~n"
         "              [--start|-s <module>]  Start module~n"
         "              [--remove_lines|-r]    Remove line number information from AVM files~n"
@@ -185,12 +193,17 @@ do_create(Opts, Args) ->
     [OutputFile | InputFiles] = Args,
     ok = packbeam_api:create(
         OutputFile,
-        InputFiles,
+        InputFiles ++ maps:get(external, Opts, []),
         #{
             lib => maps:get(lib, Opts, false),
             prune => maps:get(prune, Opts, false),
             start_module => maps:get(start_module, Opts, undefined),
-            include_lines => not maps:get(remove_lines, Opts, false)
+            include_lines => not maps:get(remove_lines, Opts, false),
+            references => maps:get(references, Opts, []),
+            keep => maps:get(keep, Opts, []),
+            suggest_drivers => maps:get(suggest_drivers, Opts, false),
+            precision => maps:get(precision, Opts, full),
+            jit_types => maps:get(jit_types, Opts, false)
         }
     ),
     0.
@@ -317,6 +330,35 @@ parse_args(Argv) ->
 %% @private
 parse_args([], {Opts, Args}) ->
     {Opts, lists:reverse(Args)};
+parse_args(["--prune-modules" | T], {Opts, Args}) ->
+    parse_args(T, {Opts#{prune => modules}, Args});
+parse_args(["--prune-functions" | T], {Opts, Args}) ->
+    parse_args(T, {Opts#{prune => functions}, Args});
+parse_args(["--reference", Path | T], {Opts, Args}) ->
+    parse_args(T, {Opts#{references => maps:get(references, Opts, []) ++ [Path]}, Args});
+parse_args(["-e", Path | T], State) ->
+    parse_args(["--external", Path | T], State);
+parse_args(["--external", Path | T], {Opts, Args}) ->
+    parse_args(T, {Opts#{external => maps:get(external, Opts, []) ++ [Path]}, Args});
+parse_args(["--keep", MFA | T], {Opts, Args}) ->
+    Root =
+        try
+            [M, F, A] = string:tokens(MFA, ":/"),
+            {list_to_atom(M), list_to_atom(F), list_to_integer(A)}
+        catch
+            error:_ -> bad_option("--keep", MFA)
+        end,
+    parse_args(T, {Opts#{keep => maps:get(keep, Opts, []) ++ [Root]}, Args});
+parse_args(["--precision", Mode | T], {Opts, Args}) when
+    Mode =:= "full"; Mode =:= "adaptive"; Mode =:= "insensitive"; Mode =:= "coarse"
+->
+    parse_args(T, {Opts#{precision => list_to_atom(Mode)}, Args});
+parse_args(["--precision", Mode | _], _) ->
+    bad_option("--precision", Mode);
+parse_args(["--jit-types" | T], {Opts, Args}) ->
+    parse_args(T, {Opts#{jit_types => true}, Args});
+parse_args(["--suggest-drivers" | T], {Opts, Args}) ->
+    parse_args(T, {Opts#{suggest_drivers => true}, Args});
 parse_args(["-out", Path | T], {Opts, Args}) ->
     io:format("WARNING.  Deprecated option.  Use --out instead.~n"),
     parse_args(["--out", Path | T], {Opts, Args});
@@ -355,3 +397,9 @@ parse_args(["--format", Format | T], {Opts, Args}) ->
     parse_args(T, {Opts#{format => Format}, Args});
 parse_args([H | T], {Opts, Args}) ->
     parse_args(T, {Opts, [H | Args]}).
+
+%% @private
+bad_option(Option, Value) ->
+    io:format(standard_error, "packbeam: invalid value for ~s: ~s~n", [Option, Value]),
+    print_help(),
+    erlang:halt(255).

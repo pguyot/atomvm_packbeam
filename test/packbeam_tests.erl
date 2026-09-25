@@ -211,7 +211,7 @@ packbeam_create_prune_test() ->
         lists:join(" ", [
             Packbeam,
             "create",
-            "--prune",
+            "--prune-modules",
             "--start",
             "b",
             AVMFile,
@@ -273,7 +273,16 @@ packbeam_prune_no_start_module_test() ->
 
     CMD = lists:flatten(
         lists:join(" ", [
-            Packbeam, "create", "--prune", "--start", "b", AVMFile, BEAM_D, BEAM_E, BEAM_F, TXT
+            Packbeam,
+            "create",
+            "--prune-modules",
+            "--start",
+            "b",
+            AVMFile,
+            BEAM_D,
+            BEAM_E,
+            BEAM_F,
+            TXT
         ])
     ),
     Fail = os:cmd(CMD),
@@ -284,6 +293,30 @@ packbeam_prune_no_start_module_test() ->
 
     file:delete(AVMFile),
     ok.
+
+packbeam_invalid_option_values_test() ->
+    AVMFile = dest_dir("packbeam_invalid_option_values_test.avm"),
+    BEAM_A = test_beam_path("a.beam"),
+    Packbeam = filename:absname(?PACKBEAM),
+    lists:foreach(
+        fun({Option, Value}) ->
+            CMD = lists:flatten(
+                lists:join(" ", [Packbeam, "create", "-p", Option, Value, AVMFile, BEAM_A])
+            ),
+            Output = os:cmd(CMD ++ " 2>&1; echo \"exit=$?\""),
+            ?assertMatch(
+                ok,
+                expect_contains("packbeam: invalid value for " ++ Option ++ ": " ++ Value, Output)
+            ),
+            ?assertMatch(ok, expect_contains("exit=255", Output))
+        end,
+        [
+            {"--keep", "foo:bar"},
+            {"--keep", "foo:bar/x"},
+            {"--precision", "fast"}
+        ]
+    ),
+    ?assertNot(filelib:is_file(AVMFile)).
 
 packbeam_dest_fail_test() ->
     BEAM_A = test_beam_path("a.beam"),
@@ -361,7 +394,7 @@ packbeam_list_test() ->
         lists:join(" ", [
             Packbeam,
             "create",
-            "--prune",
+            "--prune-modules",
             "--start",
             "b",
             AVMFile,
@@ -421,7 +454,9 @@ packbeam_create_dependent_avm_test() ->
     AVMFile2 = dest_dir("packbeam_create_dependent_avm_test2.avm"),
     BEAM_X = test_beam_path("x.beam"),
     CMD2 = lists:flatten(
-        lists:join(" ", [Packbeam, "create", "--prune", "--start", "x", AVMFile2, BEAM_X, AVMFile])
+        lists:join(" ", [
+            Packbeam, "create", "--prune-modules", "--start", "x", AVMFile2, BEAM_X, AVMFile
+        ])
     ),
     ?assertMatch("0", string:trim(os:cmd(CMD2 ++ "; echo $?"))),
 

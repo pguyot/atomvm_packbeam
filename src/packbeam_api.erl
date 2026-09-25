@@ -51,7 +51,14 @@
 -type path() :: string().
 -type avm_element_name() :: string().
 -type options() :: #{
-    prune => boolean(),
+    prune => boolean() | functions | modules,
+    references => [path()],
+    keep => [{module(), atom(), non_neg_integer()}],
+    diagnostics => fun((map()) -> term()),
+    suggest_drivers => boolean(),
+    precision => full | adaptive | insensitive | coarse,
+    jit_types => boolean(),
+    precompile => fun((module(), binary()) -> binary()),
     lib => boolean(),
     start_module => module() | undefined,
     application_module => module() | undefined,
@@ -129,13 +136,42 @@ create(OutputPath, InputPaths, Options) ->
         include_lines := IncludeLines
     } = maps:merge(?DEFAULT_OPTIONS, Options),
     ParsedFiles = parse_files(InputPaths, Lib, StartModule, IncludeLines),
-    write_packbeam(
-        OutputPath,
+    PrunedFiles =
         case Prune of
-            true -> prune(ParsedFiles, ApplicationModule);
+            functions -> prune_functions(ParsedFiles, Options);
+            true -> prune_functions(ParsedFiles, Options);
+            modules -> prune(ParsedFiles, ApplicationModule);
             _ -> ParsedFiles
+        end,
+    write_packbeam(OutputPath, precompile(PrunedFiles, maps:get(precompile, Options, undefined))).
+
+legacy_prune(true) -> modules;
+legacy_prune(false) -> false.
+
+%% Every result is built before the AVM is written, so a failing compiler
+%% cannot leave a partial archive.
+precompile(Files, undefined) ->
+    Files;
+precompile(Files, Compiler) when is_function(Compiler, 2) ->
+    [
+        case is_beam(P) of
+            false ->
+                P;
+            true ->
+                M = get_element_module(P),
+                B = Compiler(M, get_element_data(P)),
+                case beam_lib:all_chunks(B) of
+                    {ok, M, Cs} ->
+                        case lists:keymember("avmN", 1, Cs) of
+                            true -> lists:keystore(data, 1, P, {data, B});
+                            false -> error({missing_precompiled_code, M})
+                        end;
+                    _ ->
+                        error({invalid_precompile_result, M})
+                end
         end
-    ).
+     || P <- Files
+    ].
 
 %%-----------------------------------------------------------------------------
 %% @param   OutputPath the path to write the AVM file
@@ -168,7 +204,7 @@ create(OutputPath, InputPaths, Prune, StartModule) ->
     io:format("WARNING: Deprecated function will be removed in the 0.9.0 release: ~p:create/4~n", [
         ?MODULE
     ]),
-    Options = #{prune => Prune, start_module => StartModule},
+    Options = #{prune => legacy_prune(Prune), start_module => StartModule},
     create(OutputPath, InputPaths, maps:merge(?DEFAULT_OPTIONS, Options)).
 
 %%-----------------------------------------------------------------------------
@@ -208,7 +244,9 @@ create(OutputPath, InputPaths, ApplicationModule, Prune, StartModule) ->
         ?MODULE
     ]),
     Options = #{
-        prune => Prune, start_module => StartModule, application_module => ApplicationModule
+        prune => legacy_prune(Prune),
+        start_module => StartModule,
+        application_module => ApplicationModule
     },
     create(OutputPath, InputPaths, maps:merge(?DEFAULT_OPTIONS, Options)).
 
@@ -393,6 +431,130 @@ load_file(Path) ->
         {error, Reason} ->
             throw(io_lib:format("Unable to load file ~s.  Reason: ~p", [Path, Reason]))
     end.
+
+prune_functions(AllFiles, Options) ->
+    References = parse_files(maps:get(references, Options, []), true, undefined, true),
+    ParsedFiles = drop_shadowed(AllFiles),
+    Beams = [get_element_data(P) || P <- ParsedFiles, is_code(P)],
+    RefBeams = [get_element_data(P) || P <- References, is_code(P)],
+    StartModule =
+        case maps:get(start_module, Options, undefined) of
+            undefined ->
+                case find_entrypoint(ParsedFiles) of
+                    {value, Entry} -> get_element_module(Entry);
+                    false -> undefined
+                end;
+            Selected ->
+                Selected
+        end,
+    %% Without init, the package runs next to an AtomVM library installed on
+    %% the device: that library boots the start module, and the analysis
+    %% cannot see what calls into it do.
+    Runtime = lists:any(
+        fun(P) -> is_code(P) andalso get_element_module(P) =:= init end, ParsedFiles ++ References
+    ),
+    Roots =
+        case {maps:get(lib, Options, false), Runtime, StartModule} of
+            {true, _, _} -> [];
+            {false, true, _} -> [{init, boot, 1}];
+            {false, false, undefined} -> [];
+            {false, false, _} -> [{StartModule, start, 0}]
+        end,
+    %% Boot resources are opaque executable data: keep the package if used.
+    BootData =
+        case
+            lists:any(
+                fun(P) ->
+                    lists:member(lists:flatten(get_element_name(P)), [
+                        "start.boot", "init/priv/start.boot"
+                    ])
+                end,
+                ParsedFiles ++ References
+            )
+        of
+            true -> unknown;
+            false -> undefined
+        end,
+    AnalysisOptions = Options#{
+        start_module => StartModule, boot_data => BootData, open_world => not Runtime
+    },
+    %% Application callbacks may be selected from application.bin at runtime.
+    AppModules = find_application_modules(
+        ParsedFiles, maps:get(application_module, Options, undefined)
+    ),
+    AppRoots = [
+        {M, F, A}
+     || P <- ParsedFiles,
+        is_code(P),
+        M <- [get_element_module(P)],
+        lists:member(M, AppModules),
+        {F, A} <- proplists:get_value(exports, proplists:get_value(chunk_refs, P))
+    ],
+    {Trimmed, Report0} = packbeam_prune:run(Beams, RefBeams, Roots ++ AppRoots, AnalysisOptions),
+    Report = Report0#{driver_suggestions => packbeam_prune:driver_suggestions(Report0)},
+    case maps:get(diagnostics, Options, undefined) of
+        Handler when is_function(Handler, 1) -> Handler(Report);
+        undefined ->
+            lists:foreach(
+                fun(W) ->
+                    io:format(standard_error, "WARNING: ~s~n", [packbeam_prune:format_warning(W)])
+                end,
+                maps:get(warnings, Report)
+            )
+    end,
+    case maps:get(suggest_drivers, Options, false) of
+        true ->
+            lists:foreach(
+                fun(Text) -> io:format(standard_error, "Driver suggestion: ~s~n", [Text]) end,
+                maps:get(driver_suggestions, Report)
+            );
+        false ->
+            ok
+    end,
+    ByModule = maps:from_list([
+        begin
+            [P] = parse_file(beam, "", true, undefined, B, maps:get(include_lines, Options, true)),
+            {get_element_module(P), P}
+        end
+     || B <- Trimmed
+    ]),
+    [
+        case is_code(P) of
+            false ->
+                P;
+            true ->
+                New = maps:get(get_element_module(P), ByModule),
+                lists:keystore(flags, 1, New, {flags, get_flags(P)})
+        end
+     || P <- ParsedFiles, not is_code(P) orelse maps:is_key(get_element_module(P), ByModule)
+    ].
+
+%% @private
+%% AtomVM loads the first entry of a module's name: a later copy never runs.
+drop_shadowed(ParsedFiles) ->
+    {Kept, _} = lists:foldl(
+        fun(P, {Acc, Seen}) ->
+            case is_code(P) of
+                false ->
+                    {[P | Acc], Seen};
+                true ->
+                    M = get_element_module(P),
+                    case maps:is_key(M, Seen) of
+                        true -> {Acc, Seen};
+                        false -> {[P | Acc], Seen#{M => true}}
+                    end
+            end
+        end,
+        {[], #{}},
+        ParsedFiles
+    ),
+    lists:reverse(Kept).
+
+%% @private
+%% A module AtomVM can load. Some tools mark the start module with the start
+%% flag alone; it is loaded as a module all the same.
+is_code(P) ->
+    is_beam(P) orelse (is_entrypoint(P) andalso get_element_module(P) =/= undefined).
 
 %% @private
 prune(ParsedFiles, RootApplicationModule) ->
@@ -784,9 +946,11 @@ get_uncompressed_literals(ChunkRefs) ->
 maybe_uncompress_literals(Chunks) ->
     case proplists:get_value("LitT", Chunks) of
         undefined ->
-            {Chunks, undefined};
+            {Chunks, proplists:get_value("LitU", Chunks)};
+        %% Already uncompressed, but still in the longer chunk: an AVM carries
+        %% literals as LitU, so store it that way instead of four bytes more.
         <<0:32, Data/binary>> ->
-            {Chunks, Data};
+            {lists:keyreplace("LitT", 1, Chunks, {"LitU", Data}), Data};
         <<_Size:4/binary, Data/binary>> ->
             do_uncompress_literals(Chunks, Data)
     end.
